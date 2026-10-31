@@ -1,0 +1,135 @@
+#include <driver/i2s.h>
+
+// Pines del micrófono INMP441 en el ESP32
+#define I2S_WS    25
+#define I2S_SD    32
+#define I2S_SCK   33
+#define I2S_PORT I2S_NUM_0
+
+// Pines de los LEDs conectados al ESP32
+const int led1Pin = 12; // 1 a 2 picos (ej: "leds")
+const int led2Pin = 14; // 3 a 5 picos (ej: "diodos")
+const int led3Pin = 27; // 6 a 9 picos (ej: "resistencia")
+
+// Umbrales y tiempos
+const int32_t threshold = 800000;          // Sensibilidad del sonido I2S (ajústala si es necesario)
+const unsigned long cooldownTime = 120;     // Milisegundos mínimos entre picos
+const unsigned long silenceTimeout = 800;   // Tiempo de silencio (ms) para dar fin a la palabra
+
+unsigned long lastPeakTime = 0;
+bool firstPeak = true;
+
+int peakCount = 0;
+unsigned long lastActivityTime = 0;
+bool countingActive = false;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(led1Pin, OUTPUT);
+  pinMode(led2Pin, OUTPUT);
+  pinMode(led3Pin, OUTPUT);
+  
+  digitalWrite(led1Pin, LOW);
+  digitalWrite(led2Pin, LOW);
+  digitalWrite(led3Pin, LOW);
+
+  // Configuración I2S para el INMP441
+  const i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = 16000,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 1024,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  const i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+
+  if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) != ESP_OK) {
+    Serial.println("Error instalando I2S");
+    return;
+  }
+
+  if (i2s_set_pin(I2S_PORT, &pin_config) != ESP_OK) {
+    Serial.println("Error configurando pines I2S");
+    return;
+  }
+
+  Serial.println("ESP32 con INMP441 listo para contar picos...");
+}
+
+void loop() {
+  int32_t sample = 0;
+  size_t bytesIn = 0;
+
+  // Leer audio digital del INMP441
+  esp_err_t result = i2s_read(I2S_PORT, &sample, sizeof(sample), &bytesIn, 0);
+
+  if (result == ESP_OK && bytesIn == sizeof(sample)) {
+    int32_t magnitude = sample;
+    if (magnitude < 0) magnitude = -magnitude;
+
+    unsigned long currentTime = millis();
+
+    // Detección de picos superando el umbral
+    if (magnitude > threshold && (firstPeak || currentTime - lastPeakTime >= cooldownTime)) {
+      lastPeakTime = currentTime;
+      firstPeak = false;
+
+      countingActive = true;
+      lastActivityTime = currentTime;
+
+      if (peakCount < 25) {
+        peakCount++;
+      }
+
+      Serial.print("Pico detectado! Mag: ");
+      Serial.print(magnitude);
+      Serial.print(" | Total picos: ");
+      Serial.println(peakCount);
+    }
+  }
+
+  // Cuando pasa el tiempo de silencio (0.8s), evaluamos el total de la palabra
+  unsigned long currentTime = millis();
+  if (countingActive && (currentTime - lastActivityTime >= silenceTimeout)) {
+    countingActive = false;
+
+    Serial.print("--- Fin de palabra. Picos totales: ");
+    Serial.println(peakCount);
+
+    // Apagamos todos los LEDs primero
+    digitalWrite(led1Pin, LOW);
+    digitalWrite(led2Pin, LOW);
+    digitalWrite(led3Pin, LOW);
+
+    // Encendemos exclusivamente el LED que corresponde al rango
+    if (peakCount >= 1 && peakCount <= 4) {
+      digitalWrite(led1Pin, HIGH);
+      Serial.println("-> Encendido: LED 1 (1-4 picos)");
+    } 
+    else if (peakCount >= 5 && peakCount <= 10) {
+      digitalWrite(led2Pin, HIGH);
+      Serial.println("-> Encendido: LED 2 (5-10 picos)");
+    } 
+    else if (peakCount >= 11 && peakCount <= 20) {
+      digitalWrite(led3Pin, HIGH);
+      Serial.println("-> Encendido: LED 3 (11-20 picos)");
+    }
+
+    // Reiniciar para la siguiente palabra
+    peakCount = 0;
+    firstPeak = true;
+  }
+}
