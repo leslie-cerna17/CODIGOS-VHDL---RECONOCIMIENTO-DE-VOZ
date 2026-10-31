@@ -1,0 +1,167 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity contador_picos_zybo is
+    Port (
+        clk      : in  STD_LOGIC;                         -- 125 MHz (L16)
+        reset    : in  STD_LOGIC;                         -- BTN3 (Y16)
+        mic_sck  : out STD_LOGIC;                         -- T20 (JB1)
+        mic_ws   : out STD_LOGIC;                         -- U20 (JB2)
+        mic_sd   : in  STD_LOGIC;                         -- V20 (JB3)
+        leds_out : out STD_LOGIC_VECTOR(2 downto 0)       -- LD0, LD1, LD2
+    );
+end contador_picos_zybo;
+
+architecture Behavioral of contador_picos_zybo is
+
+    signal sck_divider : integer range 0 to 30 := 0;
+    signal sck_reg     : STD_LOGIC := '0';
+    signal sck_edge    : STD_LOGIC := '0';
+
+    signal ws_divider  : integer range 0 to 31 := 0;   -- CORREGIDO: 32 SCK por canal
+    signal ws_reg      : STD_LOGIC := '0';
+
+    signal bit_counter : integer range 0 to 35 := 0;
+    signal shift_reg   : STD_LOGIC_VECTOR(31 downto 0) := (others => '0');
+    signal sample_reg  : STD_LOGIC_VECTOR(31 downto 0) := (others => '0');
+    signal sample_ready: STD_LOGIC := '0';
+    signal sd_sync     : STD_LOGIC_VECTOR(1 downto 0) := "00";
+
+    constant TIMEOUT_MAX  : integer := 100_000_000;    -- 400 ms
+    constant COOLDOWN_MAX : integer := 15_000_000;     -- 120 ms
+    constant THRESHOLD    : integer := 800000;
+
+    signal silence_counter  : integer range 0 to TIMEOUT_MAX := 0;
+    signal cooldown_counter : integer range 0 to COOLDOWN_MAX := 0;
+    signal counting_active  : STD_LOGIC := '0';
+    signal cooling_down     : STD_LOGIC := '0';
+    signal peak_count       : integer range 0 to 31 := 0;
+    signal res_leds         : STD_LOGIC_VECTOR(2 downto 0) := "000";
+
+begin
+
+    -- 1. Reloj I2S (SCK = 2.08 MHz, WS = 32.5 kHz)
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            sck_divider <= 0;
+            sck_reg     <= '0';
+            sck_edge    <= '0';
+            ws_divider  <= 0;
+            ws_reg      <= '0';
+        elsif rising_edge(clk) then
+            sck_edge <= '0';
+            if sck_divider = 29 then
+                sck_divider <= 0;
+                sck_reg     <= not sck_reg;
+                if sck_reg = '0' then
+                    sck_edge <= '1';          -- flanco de subida de SCK
+                else
+                    -- flanco de bajada: aquí cambia WS
+                    if ws_divider = 31 then
+                        ws_divider <= 0;
+                        ws_reg     <= not ws_reg;
+                    else
+                        ws_divider <= ws_divider + 1;
+                    end if;
+                end if;
+            else
+                sck_divider <= sck_divider + 1;
+            end if;
+        end if;
+    end process;
+
+    mic_sck <= sck_reg;
+    mic_ws  <= ws_reg;
+
+    -- 2. Captura de la muestra (saltando el 1er bit por el retraso I2S)
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            shift_reg    <= (others => '0');
+            sample_reg   <= (others => '0');
+            bit_counter  <= 0;
+            sample_ready <= '0';
+            sd_sync      <= "00";
+        elsif rising_edge(clk) then
+            sample_ready <= '0';
+            sd_sync <= sd_sync(0) & mic_sd;
+
+            if sck_edge = '1' then
+                if ws_reg = '0' then                       -- canal izquierdo
+                    if bit_counter < 32 then
+                        if bit_counter >= 1 then           -- bit 0 = basura, se ignora
+                            shift_reg <= shift_reg(30 downto 0) & sd_sync(1);
+                        end if;
+                        bit_counter <= bit_counter + 1;
+                    end if;
+                else                                       -- canal derecho: cerrar muestra
+                    if bit_counter /= 0 then
+                        -- 31 bits capturados (d23..d0 + 7 extra): se alinea a 32 bits
+                        sample_reg   <= shift_reg(30 downto 0) & '0';
+                        sample_ready <= '1';
+                    end if;
+                    bit_counter <= 0;
+                end if;
+            end if;
+        end if;
+    end process;
+
+    -- 3. Conteo de picos
+    process(clk, reset)
+        variable abs_val : integer;
+    begin
+        if reset = '1' then
+            peak_count       <= 0;
+            silence_counter  <= 0;
+            cooldown_counter <= 0;
+            counting_active  <= '0';
+            cooling_down     <= '0';
+            res_leds         <= "000";
+        elsif rising_edge(clk) then
+
+            -- cooldown entre picos
+            if cooling_down = '1' then
+                if cooldown_counter > 0 then
+                    cooldown_counter <= cooldown_counter - 1;
+                else
+                    cooling_down <= '0';
+                end if;
+            end if;
+
+            -- timer de silencio (ANTES de la detección, para que el reinicio gane)
+            if counting_active = '1' then
+                if silence_counter > 0 then
+                    silence_counter <= silence_counter - 1;
+                else
+                    counting_active <= '0';
+                    if    peak_count >= 1  and peak_count <= 2  then res_leds <= "001";
+                    elsif peak_count >= 3  and peak_count <= 5 then res_leds <= "010";
+                    elsif peak_count >= 6 and peak_count <= 20 then res_leds <= "100";
+                    else                                             res_leds <= "000";
+                    end if;
+                    peak_count <= 0;
+                end if;
+            end if;
+
+            -- detección de pico (al final: sus asignaciones ganan)
+            if sample_ready = '1' then
+                abs_val := to_integer(abs(signed(sample_reg)));
+                if abs_val > THRESHOLD and cooling_down = '0' then
+                    cooling_down     <= '1';
+                    cooldown_counter <= COOLDOWN_MAX;
+                    counting_active  <= '1';
+                    silence_counter  <= TIMEOUT_MAX;       -- ahora SÍ se reinicia
+                    if peak_count < 25 then
+                        peak_count <= peak_count + 1;
+                    end if;
+                end if;
+            end if;
+
+        end if;
+    end process;
+
+    leds_out <= res_leds;
+
+end Behavioral;
