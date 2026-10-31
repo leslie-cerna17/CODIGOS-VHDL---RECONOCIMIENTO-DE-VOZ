@@ -1,0 +1,118 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity tb_contador_picos is
+end tb_contador_picos;
+
+architecture sim of tb_contador_picos is
+
+    constant T_PULSO : time := 1 ms;
+    constant T_GAP   : time := 130 ms;
+    constant T_FIN   : time := 700 ms;
+    constant LOUD    : integer := 200000;
+
+    -- Reloj de 125 MHz q
+    signal clk      : std_logic := '0';
+    signal reset    : std_logic := '1';
+    -- Reloj de bits del microfono 
+    signal mic_sck  : std_logic;
+    -- Seleccion de canal izquierdo/derecho 
+    signal mic_ws   : std_logic;
+    -- Datos del microfono  empieza en 0
+    signal mic_sd   : std_logic := '0';
+    -- Los 3 LEDs de salida: LD0, LD1, LD2
+    signal leds_out : std_logic_vector(2 downto 0);
+
+    -- amp = amplitud: que tan fuerte es el sonido
+    signal amp         : integer := 0;
+    -- pulso: señal de 1 bit que sube con cada golpe
+    signal pulso       : std_logic := '0';
+    -- La muestra de audio de 32 bits que el microfono simulado va a mandar bit por bit
+    signal sample_word : std_logic_vector(31 downto 0);
+
+begin
+
+
+    clk <= not clk after 4 ns;
+    dut : entity work.contador_picos_zybo
+        port map (
+            clk      => clk,        
+            reset    => reset,    
+            mic_sck  => mic_sck,  
+            mic_ws   => mic_ws,    
+            mic_sd   => mic_sd,    
+            leds_out => leds_out   
+        );
+
+    -- Arma la muestra de 32 bits a partir de amp:
+    -- to_signed(amp, 24) la pasa a 24 bits con signo
+    -- & x"00" le pega 8 ceros abajo para completar los 32 bits
+    sample_word <= std_logic_vector(to_signed(amp, 24)) & x"00";
+    mic_model : process(mic_sck)
+ 
+        variable ws_prev : std_logic := '0';
+        -- Indice del bit que toca mandar (0 a 31). Arranca en 32 
+        variable idx     : integer := 32;
+    begin
+        -- En el flanco de SUBIDA de SCK: vigilamos si WS cambio
+        if rising_edge(mic_sck) then
+            -- Si WS cambio, empieza una palabra nueva
+            if mic_ws /= ws_prev then
+                idx     := 0;          -- volvemos al primer bit 
+                ws_prev := mic_ws;     -- guardamos el nuevo valor de WS
+            end if;
+
+        elsif falling_edge(mic_sck) then
+            -- Solo mandamos datos si quedan bits y estamos en canal izquierdo (WS = 0)
+            if idx < 32 and mic_ws = '0' then
+
+                mic_sd <= sample_word(31 - idx);
+                idx := idx + 1;        -- el siguiente bit
+            else
+                -- Si no toca mandar (canal derecho o ya se mandaron los 32), mandamos 0
+                mic_sd <= '0';
+                if idx < 32 then
+                    idx := idx + 1;
+                end if;
+            end if;
+        end if;
+    end process;
+
+
+    stim : process
+    begin
+
+        reset <= '1';
+        wait for 200 ns;
+        reset <= '0';
+        wait for 1 ms;
+
+        --debe encender LD0 (1 a 2 picos
+        for i in 1 to 1 loop
+            amp <= LOUD;  pulso <= '1';  wait for T_PULSO;   -- golpe de 1 ms
+            amp <= 0;     pulso <= '0';  wait for T_GAP;     -- silencio entre golpes
+        end loop;
+        -- Esperamos a que pasen los 800 ms de silencio para que se evalue el grupo
+        wait for T_FIN;
+    
+     
+
+        -- debe encender LD1 (3 a 5 picos) 
+        for i in 1 to 3 loop
+            amp <= LOUD;  pulso <= '1';  wait for T_PULSO;
+            amp <= 0;     pulso <= '0';  wait for T_GAP;
+        end loop;
+        wait for T_FIN;
+   
+
+        --  debe encender LD2 (6 a 20 picos)
+        for i in 1 to 6 loop
+            amp <= LOUD;  pulso <= '1';  wait for T_PULSO;
+            amp <= 0;     pulso <= '0';  wait for T_GAP;
+        end loop;
+        wait for T_FIN;
+        wait;
+    end process;
+
+end sim;
